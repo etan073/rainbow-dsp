@@ -4,32 +4,65 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 import matplotlib.cm as cm
 
-# Ses ayarları
+# Matplotlib alt araç çubuğunu gizle
+plt.rcParams['toolbar'] = 'None'
+
+# Ses ve Filtre ayarları
 CHUNK = 2048     
 RATE = 44100     
+NOISE_THRESHOLD = 0.025  # Gürültü kesme seviyesi
 
-# Gürültü engelleme eşiği (0.01 ile 0.1 arasında mikrofonuna göre değiştirebilirsin)
-NOISE_THRESHOLD = 0.03  
+# Yumuşatma filtresi (Dalgaları ipeksi yapar)
+SMOOTH_WINDOW = 21  
+smooth_kernel = np.ones(SMOOTH_WINDOW) / SMOOTH_WINDOW
 
-# Grafik ayarları
-fig, ax = plt.subplots(figsize=(10, 5))
-fig.canvas.manager.set_window_title('Gürültü Engellemeli Ses Grafiği')
-fig.patch.set_facecolor('black')
-ax.set_facecolor('black')
+# Grafik Penceresi Tasarımı
+fig, ax = plt.subplots(figsize=(12, 7))
+fig.canvas.manager.set_window_title('Siber Ses Dalga Analizörü - Canlı Frekans & Genlik')
+fig.patch.set_facecolor('#05070a') # Derin siber karanlık arka plan
+ax.set_facecolor('#05070a')
 
-# Eksen ayarları
+# Sınırlar ve Eksenler
 x = np.arange(0, CHUNK)
-line, = ax.plot(x, np.zeros(CHUNK), '-', lw=2)
-ax.set_ylim(-1, 1) 
-ax.set_xlim(0, CHUNK)
-ax.set_xlabel("Zaman", color='white')
-ax.set_ylabel("Genlik", color='white')
-ax.tick_params(colors='white')
+ax.set_ylim(-0.95, 0.95) 
+ax.set_xlim(50, CHUNK - 50) 
 
-# Renk haritası 
+# Grid (Koyu siber-mavi ızgara çizgileri)
+ax.grid(True, color='#111827', linestyle='-', alpha=0.5, linewidth=1)
+ax.grid(True, which='minor', color='#0f172a', linestyle=':', alpha=0.3)
+
+# Neon Parlama Efekti (3 Katmanlı Çizgi)
+line_glow2, = ax.plot(x, np.zeros(CHUNK), '-', lw=16, alpha=0.08)
+line_glow1, = ax.plot(x, np.zeros(CHUNK), '-', lw=7, alpha=0.22)
+line, = ax.plot(x, np.zeros(CHUNK), '-', lw=2.5, alpha=0.9)
+
+# Eksen ve Etiketlerin Tasarımı
+ax.set_xlabel("ZAMAN (Örneklem)", color='#475569', fontsize=9, fontweight='bold', labelpad=10)
+ax.set_ylabel("GENLİK (Amplitude)", color='#475569', fontsize=9, fontweight='bold', labelpad=10)
+ax.tick_params(colors='#1e293b', labelsize=8)
+
+# HUD - Canlı Bilgi Metinleri (Ekrana Yerleştirilen Canlı Detaylar)
+# Sol Üst: Frekans ve Genlik Bilgileri
+text_freq = ax.text(0.02, 0.94, "FREKANS: -- Hz (--)", transform=ax.transAxes, 
+                    color='#38bdf8', fontsize=14, fontweight='bold', va='top')
+text_amp = ax.text(0.02, 0.86, "GENLİK: 0.00 (SESSİZ)", transform=ax.transAxes, 
+                   color='#34d399', fontsize=11, fontweight='bold', va='top')
+
+# Sağ Üst: Durum ve Filtre Bilgileri
+text_status = ax.text(0.98, 0.94, "DURUM: SESSİZ / BEKLEMEDE", transform=ax.transAxes, 
+                      color='#64748b', fontsize=11, fontweight='bold', ha='right', va='top')
+text_filter = ax.text(0.98, 0.88, "GÜRÜLTÜ FİLTRESİ: AKTİF (Eşik: 0.025)", transform=ax.transAxes, 
+                      color='#475569', fontsize=8, fontweight='semibold', ha='right', va='top')
+
+# Alt Bilgi: Teknoloji etiketi
+ax.text(0.5, -0.12, "CANLI SES DALGASI / REAL-TIME OSCILLOSCOPE", transform=ax.transAxes, 
+        color='#1e293b', fontsize=8, fontweight='bold', ha='center')
+
+# Gökkuşağı Renk Geçişi
 cmap = plt.get_cmap('rainbow') 
 MIN_FREQ = 80.0
 MAX_FREQ = 800.0
+smoothed_color_idx = 0.0  
 
 audio_data = np.zeros(CHUNK)
 
@@ -38,42 +71,87 @@ def audio_callback(indata, frames, time, status):
     audio_data = indata[:, 0]
 
 def update(frame):
-    global audio_data
+    global audio_data, smoothed_color_idx
     
-    # Sesin maksimum genliğini (şiddetini) ölç
+    # 1. Ses Şiddetini Ölç
     max_amplitude = np.max(np.abs(audio_data))
     
-    # Eğer ses şiddeti gürültü eşiğinin altındaysa, dalgayı sıfırla (düz çizgi)
+    # Eğer gürültü eşiğinin altındaysa (Sessizlik)
     if max_amplitude < NOISE_THRESHOLD:
-        line.set_ydata(np.zeros(CHUNK))
-        return line,
+        zeros = np.zeros(CHUNK)
+        line.set_ydata(zeros)
+        line_glow1.set_ydata(zeros)
+        line_glow2.set_ydata(zeros)
+        
+        # HUD'ı sessiz moduna güncelle
+        text_freq.set_text("FREKANS: -- Hz")
+        text_freq.set_color('#475569')
+        text_amp.set_text(f"GENLİK: {max_amplitude:.2f} (SESSİZ)")
+        text_amp.set_color('#475569')
+        text_status.set_text("DURUM: SESSİZ")
+        text_status.set_color('#64748b')
+        return line, line_glow1, line_glow2, text_freq, text_amp, text_status
     
-    # Eşiği geçen bir ses varsa dalgayı çiz
-    line.set_ydata(audio_data)
+    # Konuşma algılandığında dalgayı yumuşat ve çiz
+    smoothed_audio = np.convolve(audio_data, smooth_kernel, mode='same')
+    line.set_ydata(smoothed_audio)
+    line_glow1.set_ydata(smoothed_audio)
+    line_glow2.set_ydata(smoothed_audio)
     
-    # Frekans hesaplama (FFT)
+    # 2. Frekans Hesaplama (FFT)
     fft_data = np.abs(np.fft.rfft(audio_data))
     freqs = np.fft.rfftfreq(CHUNK, 1.0/RATE)
     
-    # Sadece en düşük frekanslı dip sesleri filtreleyerek baskın frekansı bul
-    # 0. indeksteki DC bileşenini ve çok düşük frekanslı gürültüleri (ilk 5 indeks) atla
+    # En baskın frekansı bul
     dom_freq_idx = np.argmax(fft_data[5:]) + 5
     dom_freq = freqs[dom_freq_idx]
     
-    # Frekansı normalize et (Renk haritası için)
-    norm_freq = (dom_freq - MIN_FREQ) / (MAX_FREQ - MIN_FREQ)
-    norm_freq = max(0.0, min(1.0, norm_freq))
-    
-    # Çizgi rengini güncelle
-    line.set_color(cmap(norm_freq))
+    # Frekansı değerlendir (İnce mi Kalın mı?)
+    if dom_freq < 150:
+        pitch_type = "ÇOK KALIN / BAS"
+    elif dom_freq < 280:
+        pitch_type = "KALIN SES"
+    elif dom_freq < 450:
+        pitch_type = "ORTA / NORMAL"
+    else:
+        pitch_type = "İNCE / TİZ"
         
-    return line,
+    # Genlik Seviyesini değerlendir (Hafif mi Şiddetli mi?)
+    if max_amplitude < 0.15:
+        amp_type = "ZAYIF"
+    elif max_amplitude < 0.45:
+        amp_type = "ORTA"
+    else:
+        amp_type = "YÜKSEK / GÜÇLÜ"
+    
+    # 3. HUD Detaylarını Güncelle
+    text_freq.set_text(f"FREKANS: {int(dom_freq)} Hz ({pitch_type})")
+    text_freq.set_color('#38bdf8') # Canlı Mavi
+    
+    text_amp.set_text(f"GENLİK: {max_amplitude:.2f} ({amp_type})")
+    text_amp.set_color('#34d399' if max_amplitude < 0.45 else '#f87171') # Orta ise yeşil, yüksekse kırmızıya yaklaşır
+    
+    text_status.set_text("DURUM: SES ALGILANIYOR")
+    text_status.set_color('#fbbf24') # Parlak sarı
+    
+    # 4. Renk Geçişi ve Uygulama
+    target_color_idx = (dom_freq - MIN_FREQ) / (MAX_FREQ - MIN_FREQ)
+    target_color_idx = max(0.0, min(1.0, target_color_idx))
+    smoothed_color_idx = smoothed_color_idx * 0.88 + target_color_idx * 0.12
+    current_color = cmap(smoothed_color_idx)
+    
+    line.set_color(current_color)
+    line_glow1.set_color(current_color)
+    line_glow2.set_color(current_color)
+        
+    return line, line_glow1, line_glow2, text_freq, text_amp, text_status
 
-print("Mikrofon dinleniyor... Kapatmak için grafik penceresini kapatın.")
+print("Siber Ses Analizörü Başlatıldı...")
 try:
     stream = sd.InputStream(channels=1, samplerate=RATE, blocksize=CHUNK, callback=audio_callback)
     with stream:
-        ani = FuncAnimation(fig, update, interval=20, blit=True, cache_frame_data=False)
+        ani = FuncAnimation(fig, update, interval=16, blit=True, cache_frame_data=False)
+        plt.tight_layout()
         plt.show()
 except Exception as e:
     print(f"Bir hata oluştu: {e}")
