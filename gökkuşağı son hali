@@ -1,0 +1,302 @@
+import argparse
+import colorsys
+import sys
+import threading
+import time
+
+import numpy as np
+
+FFT_SIZE = 4096
+BANDS = 44
+ANGLES = 72
+
+# Yükseklik ayarları: mikrofonun sayısal RMS değeri (fiziksel dB SPL değil).
+FULL_HEIGHT_RMS = 0.15  # Küçült: tepeye daha kolay çıkar. Büyüt: daha zor çıkar.
+HEIGHT_GAMMA = 1.35    # 1: doğrusal. 1'den büyük: kısık sesler daha alçak.
+MAX_HEIGHT = 1.45
+ATTACK_SECONDS = 0.30  # Büyüdükçe yükselme yumuşar/yavaşlar.
+RELEASE_SECONDS = 0.60  # Büyüdükçe alçalma yumuşar/yavaşlar.
+COLOR_SECONDS = 0.40
+BRIGHTNESS_ATTACK_SECONDS = 0.35
+BRIGHTNESS_RELEASE_SECONDS = 0.65
+
+
+def height_target(rms, threshold, gain, full_height_rms):
+    """Sabit referans: kısık sesi otomatik olarak tam yüksekliğe büyütmez."""
+    level = np.clip((rms - threshold) * gain /
+                    (full_height_rms - threshold), 0.0, 1.0)
+    return float(level ** HEIGHT_GAMMA)
+
+
+
+class Spectrum:
+    """Hann penceresi + gerçek FFT + logaritmik frekans bantları."""
+    def __init__(self, rate, threshold=0.003):
+        self.rate = rate
+        self.threshold = threshold
+        self.window = np.hanning(FFT_SIZE)
+        self.freq = np.fft.rfftfreq(FFT_SIZE, 1 / rate)
+        self.edges = np.geomspace(60, min(8000, rate * 0.45), BANDS + 1)
+        self.centers = np.sqrt(self.edges[:-1] * self.edges[1:])
+        self.indices = []
+        for low, high, center in zip(self.edges[:-1], self.edges[1:], self.centers):
+            ix = np.flatnonzero((self.freq >= low) & (self.freq < high))
+            if not ix.size:
+                ix = np.array([np.argmin(abs(self.freq - center))])
+            self.indices.append(ix)
+        self.levels = np.zeros(BANDS)
+
+    def process(self, samples):
+        samples = np.asarray(samples, dtype=float)
+        samples = samples - np.mean(samples)  # DC bileşenini çıkar
+        rms = float(np.sqrt(np.mean(samples ** 2)))
+        amplitude = 2 * abs(np.fft.rfft(samples * self.window)) / self.window.sum()
+        target = np.array([np.max(amplitude[ix]) for ix in self.indices])
+        if rms < self.threshold:
+            target[:] = 0
+            peak = 0.0
+        else:
+            usable = np.flatnonzero((self.freq >= self.edges[0]) & (self.freq <= self.edges[-1]))
+            peak = float(self.freq[usable[np.argmax(amplitude[usable])]])
+        # Sabit dB ölçeği: sessiz gürültüyü her karede maksimuma büyütmez.
+        target = np.clip((20 * np.log10(target + 1e-10) + 65) / 55, 0, 1)
+        speed = np.where(target > self.levels, 0.55, 0.16)
+        self.levels += speed * (target - self.levels)
+        return self.levels.copy(), rms, peak
+
+
+class WaveHistory:
+    """Sesin renk ve genlik geçmişini gerçek geçen süreyle dışarı taşır."""
+    def __init__(self, low=100, high=2500):
+        self.low, self.high = low, high
+        self.ages = np.linspace(0, 2.6, BANDS)
+        self.color = np.zeros(BANDS)
+        self.energy = np.zeros(BANDS)
+        self.current_color = 0.0
+        self.current_energy = 0.0
+        self.last = None
+
+    def advance(self, elapsed, rms, peak, threshold):
+        dt = 0.05 if self.last is None else max(0, elapsed - self.last)
+        self.last = elapsed
+        if dt <= 0:
+            return self.color.copy(), self.energy.copy()
+        if peak > 0:
+            target = np.clip(np.log(max(peak, self.low) / self.low) /
+                             np.log(self.high / self.low), 0, 1)
+            self.current_color += (1 - np.exp(-dt / COLOR_SECONDS)) * (target - self.current_color)
+        target_energy = np.clip((20 * np.log10(rms + 1e-10) + 55) / 35, 0, 1)
+        if rms < threshold or peak <= 0:
+            target_energy = 0
+        tau = (BRIGHTNESS_ATTACK_SECONDS if target_energy > self.current_energy
+               else BRIGHTNESS_RELEASE_SECONDS)
+        self.current_energy += (1 - np.exp(-dt / tau)) * (target_energy - self.current_energy)
+        self.color = np.interp(self.ages - dt, self.ages, self.color,
+                               left=self.current_color, right=self.current_color)
+        self.energy = np.interp(self.ages - dt, self.ages, self.energy,
+                                left=self.current_energy, right=0)
+        self.color[0], self.energy[0] = self.current_color, self.current_energy
+        return self.color.copy(), self.energy.copy()
+
+
+class AudioBuffer:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.samples = np.zeros(FFT_SIZE, dtype=np.float32)
+        self.status = ''
+        self.updated = time.monotonic()
+
+    def callback(self, indata, frames, timing, status):
+        # Grafik/FFT burada çalışmaz; mikrofon callback'i kısa tutulur.
+        mono = indata[:, 0]
+        with self.lock:
+            n = len(mono)
+            if n >= FFT_SIZE:
+                self.samples[:] = mono[-FFT_SIZE:]
+            else:
+                self.samples[:-n] = self.samples[n:]
+                self.samples[-n:] = mono
+            self.status = str(status) if status else ''
+            self.updated = time.monotonic()
+
+    def read(self):
+        with self.lock:
+            return self.samples.copy(), self.status, self.updated
+
+
+def build_view(args, rate, buffer):
+    import matplotlib
+    if args.snapshot:
+        matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from matplotlib.animation import FuncAnimation
+    from matplotlib.colors import ListedColormap, Normalize
+    from matplotlib.cm import ScalarMappable
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+    spectrum = Spectrum(rate, args.threshold)
+    fig = plt.figure(figsize=(12, 8), facecolor='#080e1c')
+    manager = fig.canvas.manager
+    if hasattr(manager, 'set_window_title'):
+        manager.set_window_title('Zeynep | 3B Gökkuşağı Ses')
+    ax = fig.add_subplot(111, projection='3d', facecolor='#080e1c')
+    ax.set_position([0.05, 0.15, 0.84, 0.73])
+    ax.set(xlim=(-5.4, 5.4), ylim=(-5.4, 5.4), zlim=(-0.15, 1.6))
+    ax.set_box_aspect((1, 1, 0.48), zoom=1.3)
+    ax.view_init(elev=29, azim=-55)
+    ax.set_axis_off()
+    fig.text(0.06, 0.93, 'SESİNİN GÖKKUŞAĞI', color='white', size=21, weight='bold')
+    fig.text(0.06, 0.89, 'CANLI GENLİK + FREKANS  /  SESE TEPKİ VEREN MERKEZ', color='#99aec7', size=10)
+    info = fig.text(0.06, 0.09, '', color='#d1deed', size=11)
+    fig.text(0.06, 0.045, 'Fare: döndür   •   ↑ / ↓: hassasiyet   •   R: kamerayı sıfırla', color='#7e94b1', size=10)
+
+    radius = np.linspace(0, 5, BANDS)
+    angle = np.linspace(0, 2 * np.pi, ANGLES + 1)
+    rr, aa = np.meshgrid(radius, angle, indexing='ij')
+    xx, yy = rr * np.cos(aa), rr * np.sin(aa)
+    # HSV'de mavi (2/3) -> camgöbeği -> yeşil -> sarı -> kırmızı (0).
+    rgb = np.array([colorsys.hsv_to_rgb((1 - u) * 2 / 3, 0.95, 1) for u in np.linspace(0, 1, BANDS)])
+    rgba = np.column_stack((np.repeat((rgb[:-1] + rgb[1:]) / 2, ANGLES, axis=0), np.ones((BANDS - 1) * ANGLES)))
+    vertices = np.zeros(((BANDS - 1) * ANGLES, 4, 3))
+
+    def fill_vertices(z):
+        for dim, grid in enumerate((xx, yy, z)):
+            vertices[:, :, dim] = np.stack((grid[:-1, :-1], grid[1:, :-1], grid[1:, 1:], grid[:-1, 1:]), axis=-1).reshape(-1, 4)
+        return vertices
+
+    surface = Poly3DCollection(fill_vertices(np.zeros_like(rr)), facecolors=rgba,
+                               edgecolors='none', linewidths=0, zsort='average')
+    ax.add_collection3d(surface)
+    # Skala sabit, yüzey renkleri ses frekansıyla her karede değişir.
+    history = WaveHistory()
+    cax = fig.add_axes([0.89, 0.25, 0.018, 0.48])
+    cb = fig.colorbar(ScalarMappable(norm=Normalize(0, 1), cmap=ListedColormap(rgb)), cax=cax)
+    tick_freq = np.array([history.low, 700, 1500, history.high])
+    ticks = np.log(tick_freq / history.low) / np.log(history.high / history.low)
+    cb.set_ticks(ticks, labels=[f'{f:g} Hz' for f in tick_freq])
+    cb.ax.tick_params(colors='#c6d3e4', labelsize=9)
+    cb.outline.set_visible(False)
+    cb.ax.set_title('TİZ', color='#ff6855', fontsize=10, pad=12)
+    cb.ax.set_xlabel('PES', color='#549eff', fontsize=10, labelpad=12)
+    start = time.monotonic()
+    gain = [args.gain]
+    live_amplitude = [0.0]
+    # Pozitif, yumuşak merkez tepesi; kenarda sıfıra iner.
+    center_profile = (np.exp(-(rr / 1.75) ** 2) - np.exp(-(5 / 1.75) ** 2)) / (1 - np.exp(-(5 / 1.75) ** 2))
+    last_amplitude_time = [None]
+    # Genlik çubuğu: yüzeyle aynı RMS tabanlı görsel ölçeği kullanır.
+    meter_ax = fig.add_axes([0.06, 0.13, 0.77, 0.018], facecolor='#17253a')
+    meter_ax.set_xlim(0, 1)
+    meter_ax.set_ylim(0, 1)
+    meter_ax.set_xticks([])
+    meter_ax.set_yticks([])
+    for spine in meter_ax.spines.values():
+        spine.set_visible(False)
+    meter = meter_ax.barh(0.5, 0, height=1, color='#54baff')[0]
+    fig.text(0.06, 0.157, 'SES ŞİDDETİ  /  YÜKSEKLİK', color='#99aec7', size=9)
+
+    def update(frame):
+        elapsed = frame / 20 if args.snapshot else time.monotonic() - start
+        if args.demo or args.snapshot:
+            tt = np.arange(FFT_SIZE) / rate + elapsed
+            freq = 80 * (50 ** ((np.sin(elapsed * 2.0 - 1.2) + 1) / 2))
+            demo_gain = 0.25 + 0.75 * (np.sin(elapsed * 3) + 1) / 2
+            samples = demo_gain * (0.075 * np.sin(2 * np.pi * freq * tt) + 0.025 * np.sin(2 * np.pi * freq * 2 * tt))
+            status, age = '', 0
+        else:
+            samples, status, stamp = buffer.read()
+            age = time.monotonic() - stamp
+            if age > 0.7:
+                samples[:] = 0
+        levels, rms, peak = spectrum.process(samples)
+        color_history, energy_history = history.advance(elapsed, rms, peak, args.threshold)
+        dt = 0.05 if last_amplitude_time[0] is None else max(0, elapsed - last_amplitude_time[0])
+        last_amplitude_time[0] = elapsed
+        # Yükseklik yalnızca ses şiddetinden gelir; frekanstan bağımsızdır.
+        target_amplitude = height_target(rms, args.threshold, gain[0], args.full_rms)
+        tau = ATTACK_SECONDS if target_amplitude > live_amplitude[0] else RELEASE_SECONDS
+        alpha = 1 - np.exp(-dt / tau)
+        live_amplitude[0] += alpha * (target_amplitude - live_amplitude[0])
+        peak_height = MAX_HEIGHT * live_amplitude[0]
+        # Merkez sadece ses genliğiyle yükselir; zamana bağlı geometrik salınım yok.
+        z = peak_height * center_profile
+        meter.set_width(live_amplitude[0])
+        meter.set_color(colorsys.hsv_to_rgb((1 - history.current_color) * 2 / 3, 0.8, 1))
+        surface.set_verts(fill_vertices(z))
+        face_color = (color_history[:-1] + color_history[1:]) / 2
+        face_energy = (energy_history[:-1] + energy_history[1:]) / 2
+        live_rgb = np.array([colorsys.hsv_to_rgb((1 - hue) * 2 / 3, 0.94,
+                             0.04 + 0.96 * strength)
+                             for hue, strength in zip(face_color, face_energy)])
+        # Hafif ışık-gölge, renkli yüzeyin 3B kıvrımlarını görünür kılar.
+        shade = 0.82 + 0.18 * np.cos(angle[:-1] - 0.7)
+        face_rgb = (live_rgb[:, None, :] * shade[None, :, None]).reshape(-1, 3)
+        surface.set_facecolors(np.column_stack((face_rgb, np.ones(len(face_rgb)))))
+        mode = 'DEMO' if args.demo or args.snapshot else 'MİKROFON'
+        state = f'Baskın frekans: {peak:.0f} Hz' if peak else 'Ses bekleniyor…'
+        if age > 0.7:
+            state = 'Mikrofondan veri gelmiyor; cihazı ve izinleri kontrol et.'
+        if status:
+            state += '  |  Ses tamponu uyarısı'
+        info.set_text(f'{mode}   •   {state}   •   RMS: {rms:.3f}   •   Görsel genlik: {live_amplitude[0]*100:.0f}%   •   Kazanç: {gain[0]:.1f}')
+        return surface, info, meter
+
+    def key(event):
+        if event.key == 'up':
+            gain[0] = min(gain[0] + 0.2, 4)
+        elif event.key == 'down':
+            gain[0] = max(gain[0] - 0.2, 0.2)
+        elif event.key == 'r':
+            ax.view_init(elev=29, azim=-55)
+        fig.canvas.draw_idle()
+    fig.canvas.mpl_connect('key_press_event', key)
+    if args.snapshot:
+        for i in range(65):
+            update(i)
+        fig.savefig(args.snapshot, dpi=140, facecolor=fig.get_facecolor())
+        plt.close(fig)
+    else:
+        animation = FuncAnimation(fig, update, interval=50, blit=False, cache_frame_data=False)
+        plt.show()  # animation değişkeni pencere açıkken canlı kalır
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--demo', action='store_true')
+    parser.add_argument('--devices', action='store_true')
+    parser.add_argument('--device', type=int, default=None)
+    parser.add_argument('--gain', type=float, default=1.0)
+    parser.add_argument('--full-rms', type=float, default=FULL_HEIGHT_RMS,
+                        help='Tam yüksekliğe karşılık gelen RMS (varsayılan: 0.15)')
+    parser.add_argument('--threshold', type=float, default=0.003)
+    parser.add_argument('--snapshot', metavar='PNG', help='Mikrofonsuz önizleme görseli kaydet')
+    args = parser.parse_args()
+    if (not np.all(np.isfinite([args.gain, args.threshold, args.full_rms]))
+            or args.gain <= 0 or args.threshold < 0 or args.full_rms <= args.threshold):
+        parser.error('gain pozitif, threshold >= 0 ve full-rms > threshold olmalı.')
+    if (args.demo or args.snapshot) and not args.devices:
+        build_view(args, 48000, None)
+        return
+    try:
+        import sounddevice as sd
+    except ImportError:
+        sys.exit('Eksik paket. Terminalde: python -m pip install sounddevice')
+    try:
+        if args.devices:
+            print(sd.query_devices())
+            return
+        device = sd.query_devices(args.device, 'input')
+        rate = int(device['default_samplerate'])
+        buffer = AudioBuffer()
+        print(f"Mikrofon: {device['name']} | {rate} Hz\nDurdurmak için grafik penceresini kapat.")
+        with sd.InputStream(device=args.device, samplerate=rate, channels=1,
+                            blocksize=1024, dtype='float32', callback=buffer.callback):
+            build_view(args, rate, buffer)
+    except (sd.PortAudioError, ValueError) as exc:
+        sys.exit(f'Mikrofon açılamadı: {exc}\nWindows Ayarlar > Gizlilik ve güvenlik > Mikrofon izinlerini kontrol et.\nCihazları listele: python ses_yukseklik.py --devices\nÖrn. cihaz seç: python ses_yukseklik.py --device 1\nMikrofonsuz dene: python ses_yukseklik.py --demo')
+    except KeyboardInterrupt:
+        print('\nDurduruldu.')
+
+
+if __name__ == '__main__':
+    main()
